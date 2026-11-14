@@ -11,7 +11,7 @@ run path="" *args:
     ./target/release/disk-vivarium {{path}} {{args}}
 
 test:
-    cargo test
+    cargo test --all-features
 
 fmt:
     cargo fmt

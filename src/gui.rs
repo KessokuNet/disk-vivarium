@@ -2,6 +2,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -46,6 +47,8 @@ pub struct Vivarium {
     tiles: Vec<OwnedTile>,
     scan_cache: Vec<CachedScan>,
     cache_hit: bool,
+    pending_delete: Option<Deletion>,
+    deferred_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +63,52 @@ struct LayoutKey {
 enum DirectoryAction {
     Focus(Vec<usize>),
     Scan(PathBuf),
+}
+
+enum Deletion {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+impl Deletion {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) | Self::Directory(path) => path,
+        }
+    }
+}
+
+enum TileAction {
+    Reveal(PathBuf),
+    Delete(Deletion),
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn validate_directory_removal(path: &Path) -> std::io::Result<()> {
+    if std::fs::canonicalize(path)?.parent().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to delete the filesystem root",
+        ));
+    }
+    Ok(())
+}
+
+fn file_manager_command(directory: &Path) -> std::io::Result<Command> {
+    let url = url::Url::from_file_path(std::fs::canonicalize(directory)?)
+        .map_err(|()| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file path"))?;
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
 }
 
 impl Vivarium {
@@ -85,6 +134,8 @@ impl Vivarium {
             tiles: Vec::new(),
             scan_cache: Vec::new(),
             cache_hit: false,
+            deferred_error: None,
+            pending_delete: None,
         };
         app.start_scan();
         app
@@ -100,7 +151,7 @@ impl Vivarium {
             return;
         }
         self.options.root = root;
-        self.options.max_depth = self.render_depth as u64;
+        self.options.max_depth = self.retained_depth();
         self.running_options = self.options.clone();
         self.running = None;
         self.outcome_root = self.options.root.clone();
@@ -127,9 +178,10 @@ impl Vivarium {
         if self.running.is_some() {
             return;
         }
+        self.deferred_error = None;
         self.root_text = root.to_string_lossy().into_owned();
         self.options.root = root;
-        self.options.max_depth = self.render_depth as u64;
+        self.options.max_depth = self.retained_depth();
         if let Some(outcome) = self.take_cached_outcome() {
             self.install_outcome(self.options.root.clone(), outcome, true);
         } else {
@@ -207,14 +259,29 @@ impl Vivarium {
                 let outcome = Arc::new(outcome);
                 self.cache_outcome(options.clone(), Arc::clone(&outcome));
                 self.install_outcome(options.root, outcome, false);
+                if let Some(error) = self.deferred_error.take() {
+                    self.error = Some(error);
+                }
                 self.rescan_for_extra_levels();
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => {
+                self.error = Some(match self.deferred_error.take() {
+                    Some(deletion_error) => {
+                        format!("{deletion_error}\nThe refresh also failed: {error}")
+                    }
+                    None => error.to_string(),
+                });
+            }
         }
     }
 
+    fn retained_depth(&self) -> u64 {
+        // TreeBuilder counts the scan root toward max_depth; treemap recursion starts below it.
+        self.render_depth as u64 + 1
+    }
+
     fn rescan_for_extra_levels(&mut self) {
-        if self.running.is_none() && self.render_depth as u64 > self.options.max_depth {
+        if self.running.is_none() && self.retained_depth() > self.options.max_depth {
             self.load_directory(self.current_root().to_path_buf());
         }
     }
@@ -252,6 +319,102 @@ impl Vivarium {
             &self.running_options.root
         } else {
             &self.outcome_root
+        }
+    }
+
+    fn reveal_in_file_manager(&mut self, directory: PathBuf) {
+        match file_manager_command(&directory).and_then(|mut command| command.spawn()) {
+            Ok(mut child) => {
+                drop(std::thread::spawn(move || {
+                    let _: std::io::Result<std::process::ExitStatus> = child.wait();
+                }));
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not open file manager: {error}"));
+            }
+        }
+    }
+
+    fn delete_entry(&mut self, deletion: Deletion) {
+        self.pending_delete = None;
+        if self.running.is_some() {
+            self.error = Some("Finish the current scan before deleting an entry.".into());
+            return;
+        }
+        let path = deletion.path();
+        let is_directory = matches!(&deletion, Deletion::Directory(_));
+        if is_directory && let Err(error) = validate_directory_removal(path) {
+            self.error = Some(format!("Could not delete {}: {error}", path.display()));
+            return;
+        }
+        let root = self.current_root().to_path_buf();
+        let remaining_root = if root == path {
+            let root = if is_directory {
+                std::fs::canonicalize(&root).unwrap_or(root)
+            } else {
+                root
+            };
+            containing_directory(&root).to_path_buf()
+        } else {
+            root
+        };
+        let result = match &deletion {
+            Deletion::File(path) => std::fs::remove_file(path),
+            Deletion::Directory(path) => std::fs::remove_dir_all(path),
+        };
+        if let Err(error) = result {
+            if is_directory {
+                self.refresh_after_removal(path, remaining_root);
+                let message = format!("Could not delete {}: {error}", path.display());
+                self.deferred_error = Some(message.clone());
+                self.error = Some(message);
+            } else {
+                self.error = Some(format!("Could not delete {}: {error}", path.display()));
+            }
+            return;
+        }
+        self.refresh_after_removal(path, remaining_root);
+    }
+
+    fn refresh_after_removal(&mut self, path: &Path, remaining_root: PathBuf) {
+        self.scan_cache.retain(|cached| {
+            !path.starts_with(&cached.options.root) && !cached.options.root.starts_with(path)
+        });
+        self.load_directory(remaining_root);
+    }
+
+    fn delete_confirmation(&mut self, root: &egui::Ui) {
+        let Some(deletion) = self.pending_delete.take() else {
+            return;
+        };
+        let (title, warning) = match &deletion {
+            Deletion::File(_) => ("Permanently delete file?", "This cannot be undone."),
+            Deletion::Directory(_) => (
+                "Permanently delete directory?",
+                "All its contents will also be permanently removed. This cannot be undone.",
+            ),
+        };
+        let mut confirmed = false;
+        let response =
+            egui::Modal::new(egui::Id::unique("delete-confirmation")).show(root.ctx(), |ui| {
+                ui.set_max_width(500.0);
+                ui.heading(title);
+                ui.label(deletion.path().display().to_string());
+                ui.label(warning);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        ui.close();
+                    }
+                    if ui.button("Delete permanently").clicked() {
+                        confirmed = true;
+                        ui.close();
+                    }
+                });
+            });
+        if confirmed {
+            self.delete_entry(deletion);
+        } else if !response.should_close() {
+            self.pending_delete = Some(deletion);
         }
     }
 
@@ -559,6 +722,7 @@ impl Vivarium {
 
             let mut selection = None;
             let mut drill_into = None;
+            let mut tile_action = None;
             for index in 0..self.tiles.len() {
                 let tile = self.tiles[index].clone();
                 let focused_path = self.focused_path(&tile.path);
@@ -628,7 +792,43 @@ impl Vivarium {
                     .on_hover_ui(|ui| {
                         ui.label(tip);
                     });
-                if response.hovered() || self.selected == focused_path {
+                let menu_path = PathBuf::from(path);
+                let reveal_target = if node.is_directory {
+                    menu_path.clone()
+                } else {
+                    containing_directory(&menu_path).to_path_buf()
+                };
+                let is_directory = node.is_directory;
+                let can_delete = self.running.is_none();
+                response.context_menu(|ui| {
+                    if ui.button("Reveal in file manager").clicked() {
+                        tile_action = Some(TileAction::Reveal(reveal_target.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            can_delete,
+                            egui::Button::new(if is_directory {
+                                "Delete directory"
+                            } else {
+                                "Delete file"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        let deletion = if is_directory {
+                            Deletion::Directory(menu_path.clone())
+                        } else {
+                            Deletion::File(menu_path.clone())
+                        };
+                        tile_action = Some(TileAction::Delete(deletion));
+                        ui.close();
+                    }
+                });
+                if response.hovered()
+                    || response.context_menu_opened()
+                    || self.selected == focused_path
+                {
                     painter.rect_stroke(
                         tile_rect,
                         0.0,
@@ -665,6 +865,13 @@ impl Vivarium {
             if let Some(selection) = selection {
                 self.selected = selection;
             }
+            match tile_action {
+                Some(TileAction::Reveal(directory)) => {
+                    self.reveal_in_file_manager(directory);
+                }
+                Some(TileAction::Delete(deletion)) => self.pending_delete = Some(deletion),
+                None => {}
+            }
             if let Some(path) = drill_into {
                 self.open_entry(&path);
             }
@@ -700,6 +907,8 @@ impl eframe::App for Vivarium {
         self.status_bar(root);
         self.errors_panel(root);
         self.treemap(root);
+        self.poll_scan(root.ctx());
+        self.delete_confirmation(root);
     }
 }
 
@@ -768,12 +977,18 @@ fn color(node: &Node, depth: usize) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryAction, SCAN_CACHE_CAPACITY, Vivarium};
+    use super::{
+        Deletion, DirectoryAction, SCAN_CACHE_CAPACITY, Vivarium, containing_directory,
+        file_manager_command, validate_directory_removal,
+    };
     use crate::{
         Node,
         scan::{ScanOptions, ScanOutcome},
     };
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     fn app_with_tree(tree: Node) -> Vivarium {
         let root = PathBuf::from("/");
@@ -804,6 +1019,8 @@ mod tests {
             tiles: Vec::new(),
             scan_cache: Vec::new(),
             cache_hit: false,
+            deferred_error: None,
+            pending_delete: None,
         }
     }
 
@@ -817,19 +1034,236 @@ mod tests {
         app.finish_scan(Ok(result));
     }
 
+    fn opened_file_url(command: &std::process::Command) -> PathBuf {
+        assert_eq!(command.get_program(), "xdg-open");
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments.len(), 1);
+        let url = arguments[0].to_str().expect("UTF-8 file URL");
+        assert!(url.starts_with("file://"));
+        url::Url::parse(url)
+            .expect("valid file URL")
+            .to_file_path()
+            .expect("file URL path")
+    }
+
+    #[test]
+    fn reveal_opens_directory_and_file_parent() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let directory = tempdir.path().join("folder with #");
+        let file = directory.join("large file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "data").unwrap();
+        let directory = std::fs::canonicalize(directory).unwrap();
+
+        let file_command = file_manager_command(containing_directory(&file)).unwrap();
+        let directory_command = file_manager_command(&directory).unwrap();
+        assert_eq!(opened_file_url(&file_command), directory);
+        assert_eq!(opened_file_url(&directory_command), directory);
+    }
+
+    #[test]
+    fn scans_and_file_refreshes_keep_selected_display_levels() {
+        for display_depth in [1, 2, 3, 4] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let nested = tempdir.path().join("one/two/three/four");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("kept"), "data").unwrap();
+            let removed = tempdir.path().join("removed");
+            std::fs::write(&removed, "data").unwrap();
+            let mut app = Vivarium::new(tempdir.path().to_path_buf());
+            complete_scan(&mut app);
+            app.render_depth = display_depth;
+            app.start_scan();
+            complete_scan(&mut app);
+
+            let deepest_path = |app: &Vivarium| {
+                let mut node = &app.outcome.as_ref().unwrap().tree;
+                let mut path = Vec::new();
+                for name in ["one", "two", "three", "four"]
+                    .into_iter()
+                    .take(app.render_depth)
+                {
+                    let index = node.children.iter().position(|child| child.name == name)?;
+                    node = &node.children[index];
+                    path.push(index);
+                }
+                Some(path)
+            };
+            let expected_path = deepest_path(&app).expect("selected nested levels");
+            let tiles = crate::treemap::layout_with_depth(
+                &app.outcome.as_ref().unwrap().tree,
+                crate::treemap::Bounds::from_size(800.0, 600.0),
+                app.render_depth,
+            );
+            assert!(tiles.iter().any(|tile| tile.path == expected_path));
+
+            app.delete_entry(Deletion::File(removed));
+            complete_scan(&mut app);
+
+            assert_eq!(app.render_depth, display_depth);
+            assert_eq!(app.options.max_depth, app.retained_depth());
+            let refreshed_path = deepest_path(&app).expect("nested levels after refresh");
+            let refreshed_tiles = crate::treemap::layout_with_depth(
+                &app.outcome.as_ref().unwrap().tree,
+                crate::treemap::Bounds::from_size(800.0, 600.0),
+                app.render_depth,
+            );
+            assert!(
+                refreshed_tiles
+                    .iter()
+                    .any(|tile| tile.path == refreshed_path)
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_file_invalidates_old_results_and_refreshes_the_current_root() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("root");
+        let file = root.join("large file");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&file, "data").unwrap();
+        let mut app = Vivarium::new(root.clone());
+        complete_scan(&mut app);
+        app.load_directory(tempdir.path().to_path_buf());
+        complete_scan(&mut app);
+        app.load_directory(root.clone());
+        assert!(app.cache_hit);
+
+        app.pending_delete = Some(Deletion::File(file.clone()));
+        app.delete_entry(Deletion::File(file.clone()));
+        complete_scan(&mut app);
+
+        assert!(!file.exists());
+        assert!(app.pending_delete.is_none());
+        assert!(app.outcome.as_ref().unwrap().tree.children.is_empty());
+        assert!(!app.cache_hit);
+        assert!(
+            app.scan_cache
+                .iter()
+                .all(|cached| cached.options.root != tempdir.path())
+        );
+    }
+
+    #[test]
+    fn deleting_a_scanned_file_moves_to_its_parent_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let file = tempdir.path().join("large file");
+        std::fs::write(&file, "data").unwrap();
+        let mut app = Vivarium::new(file.clone());
+        complete_scan(&mut app);
+
+        app.delete_entry(Deletion::File(file.clone()));
+        complete_scan(&mut app);
+
+        assert!(!file.exists());
+        assert_eq!(app.current_root(), tempdir.path());
+        assert!(app.outcome.is_some());
+    }
+
+    #[test]
+    fn deleting_a_directory_refreshes_its_root() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("root");
+        let removed = root.join("obsolete");
+        std::fs::create_dir_all(removed.join("nested")).unwrap();
+        std::fs::write(removed.join("nested/file"), "data").unwrap();
+        std::fs::write(root.join("keep"), "data").unwrap();
+        let mut app = Vivarium::new(root.clone());
+        complete_scan(&mut app);
+        app.load_directory(tempdir.path().to_path_buf());
+        complete_scan(&mut app);
+        app.load_directory(root.clone());
+        assert!(app.cache_hit);
+
+        app.pending_delete = Some(Deletion::Directory(removed.clone()));
+        app.delete_entry(Deletion::Directory(removed.clone()));
+        complete_scan(&mut app);
+
+        assert!(!removed.exists());
+        assert!(root.join("keep").exists());
+        let children = &app.outcome.as_ref().unwrap().tree.children;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "keep");
+        assert!(!app.cache_hit);
+        assert!(
+            app.scan_cache
+                .iter()
+                .all(|cached| cached.options.root != tempdir.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_the_current_directory_leaves_symlink_targets_intact() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("root");
+        let retained = tempdir.path().join("retained");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::write(root.join("nested/file"), "data").unwrap();
+        std::fs::write(retained.join("file"), "keep me").unwrap();
+        std::os::unix::fs::symlink(&retained, root.join("link")).unwrap();
+        let mut app = Vivarium::new(root.clone());
+        complete_scan(&mut app);
+        assert!(app.outcome.as_ref().unwrap().tree.is_directory);
+
+        app.delete_entry(Deletion::Directory(root.clone()));
+        complete_scan(&mut app);
+
+        assert!(!root.exists());
+        assert!(retained.join("file").exists());
+        assert_eq!(app.current_root(), tempdir.path());
+        assert!(app.outcome.is_some());
+    }
+
+    #[test]
+    fn directory_removal_errors_refresh_cached_results() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("root");
+        let file = root.join("file");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&file, "data").unwrap();
+        let mut app = Vivarium::new(root.clone());
+        complete_scan(&mut app);
+        app.load_directory(tempdir.path().to_path_buf());
+        complete_scan(&mut app);
+        app.load_directory(root.clone());
+        assert!(app.cache_hit);
+
+        app.delete_entry(Deletion::Directory(file.clone()));
+        assert!(file.exists());
+        assert!(app.running.is_some());
+        complete_scan(&mut app);
+
+        assert!(app.error.as_deref().unwrap().contains("Could not delete"));
+        assert!(!app.cache_hit);
+        assert!(
+            app.scan_cache
+                .iter()
+                .all(|cached| cached.options.root != tempdir.path())
+        );
+    }
+
+    #[test]
+    fn filesystem_root_cannot_be_deleted() {
+        let error = validate_directory_removal(Path::new("/")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     #[test]
     fn increasing_display_depth_refreshes_the_retained_tree() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("file"), "data").unwrap();
         let mut app = Vivarium::new(tempdir.path().to_path_buf());
         complete_scan(&mut app);
-        assert_eq!(app.options.max_depth, 3);
+        assert_eq!(app.options.max_depth, 4);
 
         app.render_depth = 4;
         app.rescan_for_extra_levels();
-        assert_eq!(app.options.max_depth, 4);
+        assert_eq!(app.options.max_depth, 5);
         complete_scan(&mut app);
-        assert_eq!(app.options.max_depth, 4);
+        assert_eq!(app.options.max_depth, 5);
         assert!(app.outcome.is_some());
     }
 
@@ -837,7 +1271,7 @@ mod tests {
     fn focused_tiles_and_completed_directories_reuse_the_correct_scan() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let root = dir.path();
-        std::fs::create_dir_all(root.join("one/two/three")).expect("nested directory");
+        std::fs::create_dir_all(root.join("one/two/three/four")).expect("nested directory");
         let mut app = Vivarium::new(root.to_path_buf());
         complete_scan(&mut app);
         let first = app.outcome.clone().expect("root result");
@@ -852,20 +1286,23 @@ mod tests {
         assert_eq!(app.focus, vec![child]);
         assert_eq!(app.focused_path(&[]), vec![child]);
         assert_eq!(app.node_at(&app.focused_path(&[])).unwrap().name, "one");
-        let focused_path = app.focused_path(&[0]);
-        assert_eq!(focused_path, vec![child, 0]);
-        assert_eq!(app.node_at(&focused_path).unwrap().name, "two");
+        let focused_path = app.focused_path(&[0, 0]);
+        assert_eq!(focused_path, vec![child, 0, 0]);
+        assert_eq!(app.node_at(&focused_path).unwrap().name, "three");
         app.open_entry(&focused_path);
         complete_scan(&mut app);
         let second = app.outcome.clone().expect("subdirectory result");
-        assert_eq!(second.tree.name, root.join("one/two").to_string_lossy());
+        assert_eq!(
+            second.tree.name,
+            root.join("one/two/three").to_string_lossy()
+        );
         assert_eq!(app.scan_cache.len(), 2);
 
         app.load_directory(root.to_path_buf());
         assert!(app.cache_hit);
         assert!(Arc::ptr_eq(app.outcome.as_ref().unwrap(), &first));
         assert!(app.running.is_none());
-        app.load_directory(root.join("one/two"));
+        app.load_directory(root.join("one/two/three"));
         assert!(app.cache_hit);
         assert!(Arc::ptr_eq(app.outcome.as_ref().unwrap(), &second));
         assert_eq!(app.scan_cache.len(), 2);
@@ -950,7 +1387,7 @@ mod tests {
     fn opening_a_pruned_directory_starts_its_sub_scan() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let root = dir.path();
-        std::fs::create_dir_all(root.join("one/two/three")).expect("nested directory");
+        std::fs::create_dir_all(root.join("one/two/three/four")).expect("nested directory");
         let mut app = Vivarium::new(root.to_path_buf());
         let first = app
             .running
@@ -969,19 +1406,27 @@ mod tests {
             .iter()
             .position(|node| node.name == "two")
             .expect("nested directory entry");
-        assert!(first.tree.children[child].children[grandchild].needs_sub_scan);
+        let cutoff = first.tree.children[child].children[grandchild]
+            .children
+            .iter()
+            .position(|node| node.name == "three")
+            .expect("cutoff directory entry");
+        assert!(first.tree.children[child].children[grandchild].children[cutoff].needs_sub_scan);
         app.outcome_root = root.to_path_buf();
         app.outcome = Some(Arc::new(first));
 
         assert_eq!(
-            app.directory_action(&[child, grandchild]),
-            Some(DirectoryAction::Scan(root.join("one/two")))
+            app.directory_action(&[child, grandchild, cutoff]),
+            Some(DirectoryAction::Scan(root.join("one/two/three")))
         );
-        app.open_directory(&[child, grandchild]);
+        app.open_directory(&[child, grandchild, cutoff]);
         complete_scan(&mut app);
         let second = app.outcome.clone().expect("subdirectory result");
-        assert_eq!(second.tree.name, root.join("one/two").to_string_lossy());
-        assert_eq!(app.root_text, root.join("one/two").to_string_lossy());
+        assert_eq!(
+            second.tree.name,
+            root.join("one/two/three").to_string_lossy()
+        );
+        assert_eq!(app.root_text, root.join("one/two/three").to_string_lossy());
         assert!(!second.tree.children[0].needs_sub_scan);
     }
 }
