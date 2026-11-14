@@ -1,0 +1,24 @@
+[package]
+name = "disk-vivarium"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+libc = "0.2"
+parallel-disk-usage = { version = "0.24.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = { version = "0.37.0", optional = true }
+rfd = { version = "0.18.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "disk-vivarium"
+path = "src/main.rs"
+required-features = ["gui"]
