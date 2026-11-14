@@ -34,7 +34,7 @@ pub enum SizeMode {
     Apparent,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanOptions {
     pub root: PathBuf,
     /// Prune nodes without pruning their contribution to ancestor totals.

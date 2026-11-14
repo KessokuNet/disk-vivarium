@@ -3,7 +3,7 @@ const MIN_EDGE: f32 = 0.5;
 pub const DIRECTORY_HEADER: f32 = 18.0;
 pub const DIRECTORY_PADDING: f32 = 2.0;
 const MIN_HEADER_WIDTH: f32 = 38.0;
-const DISPLAY_DEPTH: usize = 2;
+const DISPLAY_DEPTH: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {

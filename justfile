@@ -8,7 +8,7 @@ build:
 run path="" *args:
     cargo build --release --features gui
     sudo setcap cap_sys_admin=ep target/release/disk-vivarium
-    cargo run --release --features gui -- {{path}} {{args}}
+    ./target/release/disk-vivarium {{path}} {{args}}
 
 test:
     cargo test

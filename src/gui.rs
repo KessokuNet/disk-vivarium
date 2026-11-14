@@ -17,13 +17,20 @@ use crate::{
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TREE_REFRESH: Duration = Duration::from_millis(300);
-const SUB_SCAN_DEPTH: u64 = 2;
+const DEFAULT_DISPLAY_DEPTH: usize = 3;
+const SCAN_CACHE_CAPACITY: usize = 8;
+
+struct CachedScan {
+    options: ScanOptions,
+    outcome: Arc<ScanOutcome>,
+}
 
 pub struct Vivarium {
     root_text: String,
     options: ScanOptions,
     render_depth: usize,
     running: Option<Scan>,
+    running_options: ScanOptions,
     outcome: Option<Arc<ScanOutcome>>,
     partial: Option<Arc<Node>>,
     last_tree_refresh: Option<Instant>,
@@ -37,6 +44,8 @@ pub struct Vivarium {
     show_errors: bool,
     layout_key: Option<LayoutKey>,
     tiles: Vec<OwnedTile>,
+    scan_cache: Vec<CachedScan>,
+    cache_hit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,8 +67,9 @@ impl Vivarium {
         let mut app = Self {
             root_text: root.to_string_lossy().into_owned(),
             options: ScanOptions::new(root.clone()),
-            render_depth: 2,
+            render_depth: DEFAULT_DISPLAY_DEPTH,
             running: None,
+            running_options: ScanOptions::new(root.clone()),
             outcome: None,
             partial: None,
             last_tree_refresh: None,
@@ -73,35 +83,97 @@ impl Vivarium {
             show_errors: false,
             layout_key: None,
             tiles: Vec::new(),
+            scan_cache: Vec::new(),
+            cache_hit: false,
         };
-        app.options.max_depth = SUB_SCAN_DEPTH;
         app.start_scan();
         app
     }
 
     fn start_scan(&mut self) {
+        if self.running.is_some() {
+            return;
+        }
         let root = PathBuf::from(self.root_text.trim());
         if root.as_os_str().is_empty() {
             self.error = Some("choose a directory to scan".into());
             return;
         }
         self.options.root = root;
-        match Scan::spawn(self.options.clone()) {
+        self.options.max_depth = self.render_depth as u64;
+        self.running_options = self.options.clone();
+        self.running = None;
+        self.outcome_root = self.options.root.clone();
+        self.outcome = None;
+        self.partial = None;
+        self.last_tree_refresh = None;
+        self.focus.clear();
+        self.selected.clear();
+        self.cache_hit = false;
+        self.error = None;
+        self.show_errors = false;
+        self.generation += 1;
+        self.layout_key = None;
+        match Scan::spawn(self.running_options.clone()) {
             Ok(scan) => {
                 self.running = Some(scan);
                 self.started = Some(Instant::now());
-                self.partial = None;
-                self.outcome = None;
-                self.last_tree_refresh = None;
-                self.focus.clear();
-                self.selected.clear();
-                self.generation += 1;
-                self.layout_key = None;
-                self.error = None;
-                self.show_errors = false;
             }
             Err(error) => self.error = Some(error.to_string()),
         }
+    }
+
+    fn load_directory(&mut self, root: PathBuf) {
+        if self.running.is_some() {
+            return;
+        }
+        self.root_text = root.to_string_lossy().into_owned();
+        self.options.root = root;
+        self.options.max_depth = self.render_depth as u64;
+        if let Some(outcome) = self.take_cached_outcome() {
+            self.install_outcome(self.options.root.clone(), outcome, true);
+        } else {
+            self.start_scan();
+        }
+    }
+
+    fn take_cached_outcome(&mut self) -> Option<Arc<ScanOutcome>> {
+        let index = self
+            .scan_cache
+            .iter()
+            .position(|cached| cached.options == self.options)?;
+        let cached = self.scan_cache.remove(index);
+        let outcome = Arc::clone(&cached.outcome);
+        self.scan_cache.push(cached);
+        Some(outcome)
+    }
+
+    fn cache_outcome(&mut self, options: ScanOptions, outcome: Arc<ScanOutcome>) {
+        if let Some(index) = self
+            .scan_cache
+            .iter()
+            .position(|cached| cached.options == options)
+        {
+            self.scan_cache.remove(index);
+        }
+        self.scan_cache.push(CachedScan { options, outcome });
+        if self.scan_cache.len() > SCAN_CACHE_CAPACITY {
+            self.scan_cache.remove(0);
+        }
+    }
+
+    fn install_outcome(&mut self, root: PathBuf, outcome: Arc<ScanOutcome>, cache_hit: bool) {
+        self.show_errors = !outcome.errors.is_empty();
+        self.outcome_root = root;
+        self.outcome = Some(outcome);
+        self.partial = None;
+        self.last_tree_refresh = None;
+        self.focus.clear();
+        self.selected.clear();
+        self.cache_hit = cache_hit;
+        self.error = None;
+        self.generation += 1;
+        self.layout_key = None;
     }
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
@@ -123,20 +195,27 @@ impl Vivarium {
         let Some(result) = running.try_finish() else {
             return;
         };
+        self.finish_scan(result);
+    }
+
+    fn finish_scan(&mut self, result: std::io::Result<ScanOutcome>) {
         self.running = None;
         self.elapsed = self.started.map(|started| started.elapsed());
         match result {
             Ok(outcome) => {
-                self.focus.clear();
-                self.selected.clear();
-                self.generation += 1;
-                self.layout_key = None;
-                self.show_errors = !outcome.errors.is_empty();
-                self.outcome_root = self.options.root.clone();
-                self.outcome = Some(Arc::new(outcome));
-                self.partial = None;
+                let options = self.running_options.clone();
+                let outcome = Arc::new(outcome);
+                self.cache_outcome(options.clone(), Arc::clone(&outcome));
+                self.install_outcome(options.root, outcome, false);
+                self.rescan_for_extra_levels();
             }
             Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn rescan_for_extra_levels(&mut self) {
+        if self.running.is_none() && self.render_depth as u64 > self.options.max_depth {
+            self.load_directory(self.current_root().to_path_buf());
         }
     }
 
@@ -170,10 +249,14 @@ impl Vivarium {
 
     fn current_root(&self) -> &Path {
         if self.running.is_some() {
-            &self.options.root
+            &self.running_options.root
         } else {
             &self.outcome_root
         }
+    }
+
+    fn focused_path(&self, path: &[usize]) -> Vec<usize> {
+        self.focus.iter().chain(path).copied().collect()
     }
 
     fn directory_action(&self, path: &[usize]) -> Option<DirectoryAction> {
@@ -218,10 +301,7 @@ impl Vivarium {
                 self.focus = path.clone();
                 self.selected = path;
             }
-            DirectoryAction::Scan(path) => {
-                self.root_text = path.to_string_lossy().into_owned();
-                self.start_scan();
-            }
+            DirectoryAction::Scan(path) => self.load_directory(path),
         }
     }
 
@@ -271,8 +351,13 @@ impl Vivarium {
                 } else {
                     SizeMode::Allocated
                 };
-                ui.add(egui::Slider::new(&mut self.render_depth, 1..=4).text("Display levels"));
-                if let Some(node) = self.node_at(&[]) {
+                if ui
+                    .add(egui::Slider::new(&mut self.render_depth, 1..=4).text("Display levels"))
+                    .changed()
+                {
+                    self.rescan_for_extra_levels();
+                }
+                if let Some(node) = self.node_at(&self.focus) {
                     ui.separator();
                     ui.label(format!("{} here", format_bytes(node.size)));
                 }
@@ -314,7 +399,8 @@ impl Vivarium {
             ui.horizontal_wrapped(|ui| {
                 let mut action = None;
                 let mut up = self.focus.clone();
-                let can_go_up = up.pop().is_some() || self.current_root().parent().is_some();
+                let can_go_up = up.pop().is_some()
+                    || (self.running.is_none() && self.current_root().parent().is_some());
                 if ui.add_enabled(can_go_up, egui::Button::new("Up")).clicked() {
                     action = if up.len() < self.focus.len() {
                         Some(DirectoryAction::Focus(up))
@@ -404,7 +490,11 @@ impl Vivarium {
                     ui.label(self.node_path(&self.selected));
                     ui.separator();
                     ui.label(details);
-                    if let Some(duration) = self.elapsed {
+                    if self.cache_hit {
+                        ui.separator();
+                        ui.label("cached");
+                    }
+                    if let Some(duration) = self.elapsed.filter(|_| !self.cache_hit) {
                         ui.separator();
                         ui.label(format!("scanned in {duration:.1?}"));
                     }
@@ -471,7 +561,8 @@ impl Vivarium {
             let mut drill_into = None;
             for index in 0..self.tiles.len() {
                 let tile = self.tiles[index].clone();
-                let Some(node) = self.node_at(&tile.path) else {
+                let focused_path = self.focused_path(&tile.path);
+                let Some(node) = self.node_at(&focused_path) else {
                     continue;
                 };
                 let tile_rect = to_egui(tile.bounds);
@@ -516,7 +607,7 @@ impl Vivarium {
                     );
                 }
 
-                let path = self.node_path(&tile.path);
+                let path = self.node_path(&focused_path);
                 let mut tip = format!(
                     "{path}\n{} · {}% of the current view",
                     format_bytes(node.size),
@@ -537,7 +628,7 @@ impl Vivarium {
                     .on_hover_ui(|ui| {
                         ui.label(tip);
                     });
-                if response.hovered() || self.selected == tile.path {
+                if response.hovered() || self.selected == focused_path {
                     painter.rect_stroke(
                         tile_rect,
                         0.0,
@@ -546,10 +637,10 @@ impl Vivarium {
                     );
                 }
                 if response.clicked() {
-                    selection = Some(tile.path.clone());
+                    selection = Some(focused_path.clone());
                 }
                 if response.double_clicked() {
-                    drill_into = Some(tile.path.clone());
+                    drill_into = Some(focused_path.clone());
                 }
                 if !tile.is_directory && tile_rect.width() >= 54.0 && tile_rect.height() >= 16.0 {
                     let label_painter = painter.with_clip_rect(tile_rect);
@@ -677,7 +768,7 @@ fn color(node: &Node, depth: usize) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryAction, Vivarium};
+    use super::{DirectoryAction, SCAN_CACHE_CAPACITY, Vivarium};
     use crate::{
         Node,
         scan::{ScanOptions, ScanOutcome},
@@ -691,6 +782,7 @@ mod tests {
             options: ScanOptions::new(&root),
             render_depth: 2,
             running: None,
+            running_options: ScanOptions::new(&root),
             outcome: Some(Arc::new(ScanOutcome {
                 tree,
                 progress: Default::default(),
@@ -710,7 +802,112 @@ mod tests {
             show_errors: false,
             layout_key: None,
             tiles: Vec::new(),
+            scan_cache: Vec::new(),
+            cache_hit: false,
         }
+    }
+
+    fn complete_scan(app: &mut Vivarium) {
+        let result = app
+            .running
+            .take()
+            .expect("scan running")
+            .wait()
+            .expect("scan result");
+        app.finish_scan(Ok(result));
+    }
+
+    #[test]
+    fn increasing_display_depth_refreshes_the_retained_tree() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("file"), "data").unwrap();
+        let mut app = Vivarium::new(tempdir.path().to_path_buf());
+        complete_scan(&mut app);
+        assert_eq!(app.options.max_depth, 3);
+
+        app.render_depth = 4;
+        app.rescan_for_extra_levels();
+        assert_eq!(app.options.max_depth, 4);
+        complete_scan(&mut app);
+        assert_eq!(app.options.max_depth, 4);
+        assert!(app.outcome.is_some());
+    }
+
+    #[test]
+    fn focused_tiles_and_completed_directories_reuse_the_correct_scan() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("one/two/three")).expect("nested directory");
+        let mut app = Vivarium::new(root.to_path_buf());
+        complete_scan(&mut app);
+        let first = app.outcome.clone().expect("root result");
+        let child = first
+            .tree
+            .children
+            .iter()
+            .position(|node| node.name == "one")
+            .unwrap();
+
+        app.open_directory(&[child]);
+        assert_eq!(app.focus, vec![child]);
+        assert_eq!(app.focused_path(&[]), vec![child]);
+        assert_eq!(app.node_at(&app.focused_path(&[])).unwrap().name, "one");
+        let focused_path = app.focused_path(&[0]);
+        assert_eq!(focused_path, vec![child, 0]);
+        assert_eq!(app.node_at(&focused_path).unwrap().name, "two");
+        app.open_entry(&focused_path);
+        complete_scan(&mut app);
+        let second = app.outcome.clone().expect("subdirectory result");
+        assert_eq!(second.tree.name, root.join("one/two").to_string_lossy());
+        assert_eq!(app.scan_cache.len(), 2);
+
+        app.load_directory(root.to_path_buf());
+        assert!(app.cache_hit);
+        assert!(Arc::ptr_eq(app.outcome.as_ref().unwrap(), &first));
+        assert!(app.running.is_none());
+        app.load_directory(root.join("one/two"));
+        assert!(app.cache_hit);
+        assert!(Arc::ptr_eq(app.outcome.as_ref().unwrap(), &second));
+        assert_eq!(app.scan_cache.len(), 2);
+
+        app.start_scan();
+        assert!(!app.cache_hit);
+        assert!(app.running.is_some());
+        complete_scan(&mut app);
+        assert!(!app.cache_hit);
+        assert!(!Arc::ptr_eq(app.outcome.as_ref().unwrap(), &second));
+        assert_eq!(app.scan_cache.len(), 2);
+    }
+
+    #[test]
+    fn cache_keys_include_the_actual_scan_options() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = Vivarium::new(tempdir.path().to_path_buf());
+        assert!(app.options.btrfs);
+        app.options.btrfs = false;
+        complete_scan(&mut app);
+        assert_eq!(app.scan_cache.len(), 1);
+        assert!(app.scan_cache[0].options.btrfs);
+
+        app.load_directory(tempdir.path().to_path_buf());
+        assert!(app.running.is_some());
+        assert!(!app.cache_hit);
+        complete_scan(&mut app);
+        assert!(app.scan_cache.iter().any(|cached| !cached.options.btrfs));
+    }
+
+    #[test]
+    fn cached_scans_have_a_bounded_history() {
+        let mut app = app_with_tree(Node::leaf("root", 0));
+        let outcome = app.outcome.clone().unwrap();
+        for index in 0..SCAN_CACHE_CAPACITY + 2 {
+            app.cache_outcome(
+                ScanOptions::new(PathBuf::from(index.to_string())),
+                Arc::clone(&outcome),
+            );
+        }
+        assert_eq!(app.scan_cache.len(), SCAN_CACHE_CAPACITY);
+        assert_eq!(app.scan_cache[0].options.root, PathBuf::from("2"));
     }
 
     #[test]
@@ -753,7 +950,7 @@ mod tests {
     fn opening_a_pruned_directory_starts_its_sub_scan() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let root = dir.path();
-        std::fs::create_dir_all(root.join("one/two")).expect("nested directory");
+        std::fs::create_dir_all(root.join("one/two/three")).expect("nested directory");
         let mut app = Vivarium::new(root.to_path_buf());
         let first = app
             .running
@@ -767,23 +964,24 @@ mod tests {
             .iter()
             .position(|node| node.name == "one");
         let child = child.expect("directory entry");
-        assert!(first.tree.children[child].needs_sub_scan);
+        let grandchild = first.tree.children[child]
+            .children
+            .iter()
+            .position(|node| node.name == "two")
+            .expect("nested directory entry");
+        assert!(first.tree.children[child].children[grandchild].needs_sub_scan);
         app.outcome_root = root.to_path_buf();
         app.outcome = Some(Arc::new(first));
 
         assert_eq!(
-            app.directory_action(&[child]),
-            Some(DirectoryAction::Scan(root.join("one")))
+            app.directory_action(&[child, grandchild]),
+            Some(DirectoryAction::Scan(root.join("one/two")))
         );
-        app.open_directory(&[child]);
-        let second = app
-            .running
-            .take()
-            .expect("subdirectory scan")
-            .wait()
-            .expect("subdirectory result");
-        assert_eq!(second.tree.name, root.join("one").to_string_lossy());
-        assert_eq!(app.root_text, root.join("one").to_string_lossy());
-        assert!(second.tree.children[0].needs_sub_scan);
+        app.open_directory(&[child, grandchild]);
+        complete_scan(&mut app);
+        let second = app.outcome.clone().expect("subdirectory result");
+        assert_eq!(second.tree.name, root.join("one/two").to_string_lossy());
+        assert_eq!(app.root_text, root.join("one/two").to_string_lossy());
+        assert!(!second.tree.children[0].needs_sub_scan);
     }
 }
