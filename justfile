@@ -3,8 +3,11 @@ default:
 
 build:
     cargo build --features gui
+    sudo setcap cap_sys_admin=ep target/debug/disk-vivarium
 
 run path="" *args:
+    cargo build --release --features gui
+    sudo setcap cap_sys_admin=ep target/release/disk-vivarium
     cargo run --release --features gui -- {{path}} {{args}}
 
 test:
