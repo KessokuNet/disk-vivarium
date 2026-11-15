@@ -85,6 +85,9 @@ struct Context<'a> {
 }
 
 fn info(path: &PathBuf, context: &Context<'_>) -> Info<OsStringDisplay, BtrfsUsage> {
+    if context.progress.cancellation_requested() {
+        return Info::default();
+    }
     let stats = match symlink_metadata(path) {
         Ok(stats) => stats,
         Err(error) => {
@@ -112,6 +115,7 @@ fn info(path: &PathBuf, context: &Context<'_>) -> Info<OsStringDisplay, BtrfsUsa
     let children = if is_dir && same_device {
         match read_dir(path) {
             Ok(entries) => entries
+                .take_while(|_| !context.progress.cancellation_requested())
                 .filter_map(|entry| match entry {
                     Ok(entry) => Some(OsStringDisplay::from(entry.file_name())),
                     Err(error) => {

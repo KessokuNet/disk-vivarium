@@ -142,9 +142,6 @@ impl Vivarium {
     }
 
     fn start_scan(&mut self) {
-        if self.running.is_some() {
-            return;
-        }
         let root = PathBuf::from(self.root_text.trim());
         if root.as_os_str().is_empty() {
             self.error = Some("choose a directory to scan".into());
@@ -175,9 +172,6 @@ impl Vivarium {
     }
 
     fn load_directory(&mut self, root: PathBuf) {
-        if self.running.is_some() {
-            return;
-        }
         self.deferred_error = None;
         self.root_text = root.to_string_lossy().into_owned();
         self.options.root = root;
@@ -215,6 +209,7 @@ impl Vivarium {
     }
 
     fn install_outcome(&mut self, root: PathBuf, outcome: Arc<ScanOutcome>, cache_hit: bool) {
+        self.running = None;
         self.show_errors = !outcome.errors.is_empty();
         self.outcome_root = root;
         self.outcome = Some(outcome);
@@ -275,13 +270,22 @@ impl Vivarium {
         }
     }
 
+    fn cancel_scan(&mut self) {
+        if self.running.take().is_some() {
+            self.elapsed = self.started.map(|started| started.elapsed());
+            if let Some(error) = self.deferred_error.take() {
+                self.error = Some(error);
+            }
+        }
+    }
+
     fn retained_depth(&self) -> u64 {
         // TreeBuilder counts the scan root toward max_depth; treemap recursion starts below it.
         self.render_depth as u64 + 1
     }
 
     fn rescan_for_extra_levels(&mut self) {
-        if self.running.is_none() && self.retained_depth() > self.options.max_depth {
+        if self.retained_depth() > self.options.max_depth {
             self.load_directory(self.current_root().to_path_buf());
         }
     }
@@ -428,9 +432,7 @@ impl Vivarium {
             return None;
         }
         if node.needs_sub_scan {
-            self.running
-                .is_none()
-                .then(|| DirectoryAction::Scan(PathBuf::from(self.node_path(path))))
+            Some(DirectoryAction::Scan(PathBuf::from(self.node_path(path))))
         } else {
             Some(DirectoryAction::Focus(path.to_vec()))
         }
@@ -450,7 +452,7 @@ impl Vivarium {
             self.open_directory(path);
         } else if let Some((_, parent)) = path.split_last() {
             self.open_directory(parent);
-        } else if self.running.is_none() {
+        } else {
             let parent = self.current_root().parent().map(Path::to_path_buf);
             if let Some(parent) = parent {
                 self.navigate(DirectoryAction::Scan(parent));
@@ -471,24 +473,26 @@ impl Vivarium {
     fn toolbar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("toolbar").show(root, |ui| {
             ui.horizontal(|ui| {
-                let enabled = self.running.is_none();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Folder…"))
-                    .clicked()
-                {
+                if ui.button("Folder…").clicked() {
                     let dialog = rfd::FileDialog::new().set_directory(&self.options.root);
                     if let Some(root) = dialog.pick_folder() {
                         self.root_text = root.to_string_lossy().into_owned();
                         self.start_scan();
                     }
                 }
-                if ui.add_enabled(enabled, egui::Button::new("Scan")).clicked() {
+                if ui.button("Scan").clicked() {
                     self.start_scan();
+                }
+                if ui
+                    .add_enabled(self.running.is_some(), egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    self.cancel_scan();
                 }
                 let edit = egui::TextEdit::singleline(&mut self.root_text)
                     .desired_width(380.0)
                     .hint_text("directory to scan");
-                if ui.add_enabled(enabled, edit).lost_focus()
+                if ui.add(edit).lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter))
                 {
                     self.start_scan();
@@ -562,8 +566,7 @@ impl Vivarium {
             ui.horizontal_wrapped(|ui| {
                 let mut action = None;
                 let mut up = self.focus.clone();
-                let can_go_up = up.pop().is_some()
-                    || (self.running.is_none() && self.current_root().parent().is_some());
+                let can_go_up = up.pop().is_some() || self.current_root().parent().is_some();
                 if ui.add_enabled(can_go_up, egui::Button::new("Up")).clicked() {
                     action = if up.len() < self.focus.len() {
                         Some(DirectoryAction::Focus(up))
@@ -589,8 +592,7 @@ impl Vivarium {
                         .file_name()
                         .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy());
                     let is_current_root = path.as_path() == self.current_root();
-                    let enabled = self.running.is_none() || is_current_root;
-                    let crumb = ui.add_enabled(enabled, egui::Button::new(label));
+                    let crumb = ui.button(label);
                     if crumb.clicked() {
                         action = Some(if is_current_root {
                             DirectoryAction::Focus(Vec::new())
@@ -667,6 +669,11 @@ impl Vivarium {
                             self.show_errors = !self.show_errors;
                         }
                     }
+                } else if self.partial.is_some() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Scan cancelled; showing incomplete results.",
+                    );
                 } else {
                     ui.label("Choose a directory and press Scan.");
                 }
@@ -1252,6 +1259,21 @@ mod tests {
     }
 
     #[test]
+    fn increasing_display_depth_restarts_an_active_scan() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("file"), "data").unwrap();
+        let mut app = Vivarium::new(tempdir.path().to_path_buf());
+        assert!(app.running.is_some());
+
+        app.render_depth = 4;
+        app.rescan_for_extra_levels();
+        assert_eq!(app.options.max_depth, 5);
+        assert!(app.running.is_some());
+        complete_scan(&mut app);
+        assert!(app.outcome.is_some());
+    }
+
+    #[test]
     fn increasing_display_depth_refreshes_the_retained_tree() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("file"), "data").unwrap();
@@ -1345,6 +1367,93 @@ mod tests {
         }
         assert_eq!(app.scan_cache.len(), SCAN_CACHE_CAPACITY);
         assert_eq!(app.scan_cache[0].options.root, PathBuf::from("2"));
+    }
+
+    #[test]
+    fn drilldowns_work_during_an_active_scan() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path();
+        std::fs::create_dir(root.join("cutoff")).expect("scan target");
+        let mut cutoff = Node::new("cutoff", 0, Vec::new());
+        cutoff.needs_sub_scan = true;
+        let mut app = Vivarium::new(root.to_path_buf());
+        app.partial = Some(Arc::new(Node::new(
+            "root",
+            0,
+            vec![Node::new("one", 0, Vec::new()), cutoff],
+        )));
+
+        app.open_directory(&[0]);
+        assert_eq!(app.focus, [0]);
+        assert!(app.running.is_some());
+        app.open_directory(&[]);
+        app.open_directory(&[1]);
+        assert_eq!(app.current_root(), root.join("cutoff"));
+        assert!(app.running.is_some());
+        complete_scan(&mut app);
+        assert_eq!(app.outcome_root, root.join("cutoff"));
+    }
+
+    #[test]
+    fn rescanning_replaces_an_active_scan() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).expect("first scan root");
+        std::fs::create_dir(&second).expect("second scan root");
+        std::fs::write(second.join("visible"), "new scan").expect("test file");
+        let mut app = Vivarium::new(first);
+
+        app.root_text = second.to_string_lossy().into_owned();
+        app.start_scan();
+        assert_eq!(app.running_options.root, second);
+        complete_scan(&mut app);
+
+        assert_eq!(app.outcome_root, second);
+        assert!(app.outcome.unwrap().tree.child("visible").is_some());
+        assert_eq!(app.scan_cache.len(), 1);
+    }
+
+    #[test]
+    fn cached_navigation_cancels_an_active_scan() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path().to_path_buf();
+        let outcome = Arc::new(ScanOutcome {
+            tree: Node::leaf("cached", 1024),
+            progress: Default::default(),
+            errors: Vec::new(),
+            btrfs: None,
+            btrfs_unavailable: None,
+        });
+        let mut app = Vivarium::new(root.clone());
+        app.cache_outcome(app.options.clone(), Arc::clone(&outcome));
+
+        app.load_directory(root);
+
+        assert!(app.running.is_none());
+        assert!(app.cache_hit);
+        assert!(Arc::ptr_eq(app.outcome.as_ref().unwrap(), &outcome));
+    }
+
+    #[test]
+    fn cancel_keeps_partial_results_out_of_the_cache() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let partial = Arc::new(Node::new(
+            "root",
+            1024,
+            vec![Node::leaf("partial file", 1024)],
+        ));
+        let mut app = Vivarium::new(dir.path().to_path_buf());
+        app.partial = Some(Arc::clone(&partial));
+        app.deferred_error = Some("Deletion failed".into());
+
+        app.cancel_scan();
+
+        assert!(app.running.is_none());
+        assert!(app.outcome.is_none());
+        assert!(app.scan_cache.is_empty());
+        assert_eq!(app.error.as_deref(), Some("Deletion failed"));
+        assert!(Arc::ptr_eq(app.partial.as_ref().unwrap(), &partial));
     }
 
     #[test]

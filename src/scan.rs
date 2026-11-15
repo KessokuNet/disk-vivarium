@@ -1,4 +1,4 @@
-//! Cancellation cannot stop a pdu scan partway through; a UI can only discard its result.
+//! Cancellation is cooperative because pdu has no cancellation API.
 
 mod live;
 
@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -65,6 +65,9 @@ impl ScanOptions {
 
 #[derive(Debug, Default)]
 pub struct Progress {
+    cancelled: AtomicBool,
+    #[cfg(test)]
+    test_pause: Option<Arc<std::sync::Barrier>>,
     entries: AtomicU64,
     bytes: AtomicU64,
     errors: AtomicU64,
@@ -119,6 +122,22 @@ impl Progress {
         self.recent_errors.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn pause_for_cancellation_test(&self) {
+        if let Some(barrier) = &self.test_pause {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+
     pub(crate) fn record_error(&self, message: String) {
         self.errors.fetch_add(1, Ordering::Relaxed);
         let mut recent = self.lock();
@@ -148,8 +167,14 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanOutcome> {
     scan_reported(options, &Progress::default())
 }
 
+pub(crate) fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "scan cancelled")
+}
+
 fn scan_reported(options: &ScanOptions, progress: &Progress) -> io::Result<ScanOutcome> {
-    // Fail before the walk starts, rather than returning an empty tree for a typo'd path.
+    if progress.cancellation_requested() {
+        return Err(cancelled());
+    }
     std::fs::symlink_metadata(&options.root)?;
 
     let reporter = Recorder { progress };
@@ -164,7 +189,13 @@ fn scan_reported(options: &ScanOptions, progress: &Progress) -> io::Result<ScanO
         && crate::btrfs::is_btrfs(&options.root)?
     {
         match crate::btrfs::scan(options, progress, &reporter)? {
-            crate::btrfs::BtrfsScan::Complete(outcome) => return Ok(*outcome),
+            crate::btrfs::BtrfsScan::Complete(outcome) => {
+                return if progress.cancellation_requested() {
+                    Err(cancelled())
+                } else {
+                    Ok(*outcome)
+                };
+            }
             crate::btrfs::BtrfsScan::Unavailable(reason) => btrfs_unavailable = Some(reason),
         }
     }
@@ -176,9 +207,15 @@ fn scan_reported(options: &ScanOptions, progress: &Progress) -> io::Result<ScanO
         SizeMode::Apparent => build(options, GetApparentSize, &recorder, &reporter),
     };
 
+    if progress.cancellation_requested() {
+        return Err(cancelled());
+    }
     if options.dedupe_hardlinks {
         // Sizes stay inflated if this fails, which is cosmetic next to losing the whole scan.
         let _: Result<_, _> = recorder.deduplicate(&mut data_tree);
+    }
+    if progress.cancellation_requested() {
+        return Err(cancelled());
     }
 
     Ok(finish_tree(
@@ -204,6 +241,11 @@ fn build<Getter: GetSize<Size = Bytes> + Sync>(
         name: root_name.clone(),
         path: options.root.clone(),
         get_info: |path| {
+            #[cfg(test)]
+            reporter.progress.pause_for_cancellation_test();
+            if reporter.progress.cancellation_requested() {
+                return Info::default();
+            }
             let stats = match std::fs::symlink_metadata(path) {
                 Ok(stats) => stats,
                 Err(error) => {
@@ -223,6 +265,7 @@ fn build<Getter: GetSize<Size = Bytes> + Sync>(
             let children = if stats.is_dir() && stay {
                 match std::fs::read_dir(path) {
                     Ok(entries) => entries
+                        .take_while(|_| !reporter.progress.cancellation_requested())
                         .filter_map(|entry| match entry {
                             Ok(entry) => Some(OsStringDisplay::from(entry.file_name())),
                             Err(error) => {
@@ -381,7 +424,7 @@ where
     }
 }
 
-/// Detaching the scan cannot cancel the blocking pdu traversal.
+/// Dropping a scan requests cancellation without waiting for the filesystem.
 #[derive(Debug)]
 pub struct Scan {
     progress: Arc<Progress>,
@@ -399,6 +442,10 @@ impl Scan {
             progress,
             handle: Some(handle),
         })
+    }
+
+    pub fn cancel(&self) {
+        self.progress.cancel();
     }
 
     pub fn progress(&self) -> ProgressSnapshot {
@@ -437,9 +484,15 @@ impl Scan {
     }
 }
 
+impl Drop for Scan {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{Progress, Scan, ScanOptions, SizeMode, TreeUpdate, scan};
+    use super::{Progress, Scan, ScanOptions, SizeMode, TreeUpdate, scan, scan_reported};
 
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -517,6 +570,33 @@ mod test {
         let outcome = scan.wait().expect("scan");
         assert!(outcome.tree.size > 0);
         assert_eq!(outcome.progress.errors, 0);
+    }
+
+    #[test]
+    fn cancellation_stops_an_active_walk() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = fixture();
+        let barrier = Arc::new(Barrier::new(2));
+        let progress = Arc::new(Progress {
+            test_pause: Some(Arc::clone(&barrier)),
+            ..Progress::default()
+        });
+        let mut options = options(&dir);
+        options.btrfs = false;
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| scan_reported(&options, &progress));
+            barrier.wait();
+            progress.cancel();
+            barrier.wait();
+            worker.join().expect("scan worker did not panic")
+        });
+
+        assert_eq!(
+            result.expect_err("cancelled scan").kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(progress.snapshot().entries, 0);
     }
 
     #[test]
